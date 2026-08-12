@@ -63,9 +63,19 @@ void main() {
     expect(paths['HomeRoute'], '/home');
     // Absolute child path escapes it.
     expect(paths['ProfileRoute'], '/profile');
+    // The shell is referenced twice by the router, so this also pins that a
+    // repeated reference does not duplicate the layout.
     expect(graph.layouts, hasLength(1));
     // The layout is declared in the screen file, not the router.
     expect(graph.layouts.single.file, 'lib/screens/shell_main.dart');
+  });
+
+  test('emits one route per id when a reference is repeated', () {
+    final RouteGraph graph = parseProject(fixtureRoot);
+    final Iterable<RouteNode> shells = graph.routes.where(
+      (RouteNode route) => route.id == 'ShellRoute',
+    );
+    expect(shells, hasLength(1));
   });
 
   test('attributes routes to the file that declared them', () {

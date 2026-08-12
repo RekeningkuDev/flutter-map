@@ -23,6 +23,8 @@ class AppRouter extends RootStackRouter {
         DetailsMain.route,
         // Self-referential member: must be dropped, not recursed into.
         LegacyMain.route,
+        // The same shell referenced twice: one route node, one layout node.
+        ShellMain.route(authGuard: authGuard),
         // Redirects are not screens.
         const RedirectRoute(path: '/old-about', redirectTo: '/about'),
       ];

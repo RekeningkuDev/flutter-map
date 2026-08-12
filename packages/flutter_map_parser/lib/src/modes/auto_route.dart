@@ -151,7 +151,10 @@ void _walkAutoRoutes({
     final Expression? children = _namedArg(call.argumentList, 'children');
     final bool hasChildren = children is ListLiteral && children.elements.isNotEmpty;
     final String ownLayoutDir = absolutePath == '/' ? '' : absolutePath;
-    if (hasChildren) {
+    final bool isNewRoute = seenIds.add(id);
+    // Gated on the route being new: a shell referenced from two parents would
+    // otherwise emit one route node but two identical layouts.
+    if (hasChildren && isNewRoute) {
       layouts.add(
         LayoutNode(
           file: resolved.declaringUnit == null
@@ -162,7 +165,7 @@ void _walkAutoRoutes({
         ),
       );
     }
-    if (seenIds.add(id)) {
+    if (isNewRoute) {
       // Prefer the class that declared this route: we followed the reference to
       // get here, so it is authoritative. Falling back to the route id relies
       // on reproducing auto_route's page-class-to-route-name mangling, which
@@ -773,8 +776,15 @@ List<_DartUnit> _loadDartUnits(String projectRoot) {
     return <_DartUnit>[];
   }
   final List<_DartUnit> units = <_DartUnit>[];
-  for (final FileSystemEntity entity
-      in libDirectory.listSync(recursive: true)) {
+  // listSync order is filesystem-dependent. Class names are indexed by bare
+  // name, so an unsorted walk lets two same-named classes resolve differently
+  // on different machines and the emitted graph stops being comparable.
+  final List<FileSystemEntity> entities =
+      libDirectory.listSync(recursive: true)
+        ..sort(
+          (FileSystemEntity a, FileSystemEntity b) => a.path.compareTo(b.path),
+        );
+  for (final FileSystemEntity entity in entities) {
     if (entity is! File || !entity.path.endsWith('.dart')) {
       continue;
     }
