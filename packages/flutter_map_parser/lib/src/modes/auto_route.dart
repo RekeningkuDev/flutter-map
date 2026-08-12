@@ -46,6 +46,7 @@ AutoRouteParseResult parseAutoRouteProject(String projectRoot) {
   final _RoutePageIndex routePageFiles = _collectRoutePageFiles(
     projectRoot: projectRoot,
     units: units,
+    replaceInRouteName: _findReplaceInRouteName(units),
   );
   final _ProjectIndex index = _ProjectIndex.build(units);
   final List<RouteNode> routes = <RouteNode>[];
@@ -166,12 +167,14 @@ void _walkAutoRoutes({
       );
     }
     if (isNewRoute) {
-      // Prefer the class that declared this route: we followed the reference to
-      // get here, so it is authoritative. Falling back to the route id relies
-      // on reproducing auto_route's page-class-to-route-name mangling, which
-      // does not hold for every naming convention.
+      // An explicit `page:` names the route's own page class, so it wins: a
+      // route declared inline inside another screen's `route` member (a shell's
+      // children, say) would otherwise be attributed to the enclosing class.
+      // Without `page:` the class we followed the reference through is the best
+      // evidence available.
       final _RoutePageBinding? binding =
-          routePageFiles.byClassName[resolved.ownerClassName] ??
+          (pageType == null ? null : routePageFiles.byRouteId[id]) ??
+              routePageFiles.byClassName[resolved.ownerClassName] ??
               routePageFiles.byRouteId[id];
       final String file = binding?.file ??
           _guessPageFile(projectRoot, id) ??
@@ -564,9 +567,60 @@ class _RoutePageIndex {
   final Map<String, _RoutePageBinding> byClassName;
 }
 
+/// Reads `replaceInRouteName` off the `@AutoRouterConfig` annotation.
+///
+/// auto_route generates route class names by applying this rule to the page
+/// class name, so the parser has to apply the same rule to bind an `XxxRoute`
+/// id back to the class that declared it. Without it, a project whose pages
+/// are named by any convention other than `Page`/`Screen` binds nothing.
+String? _findReplaceInRouteName(List<_DartUnit> units) {
+  for (final _DartUnit unit in units) {
+    for (final ClassDeclaration declaration
+        in unit.unit.declarations.whereType<ClassDeclaration>()) {
+      final ArgumentList? arguments = _findAnnotation(
+        declaration,
+        <String>{'AutoRouterConfig'},
+      )?.arguments;
+      if (arguments == null) {
+        continue;
+      }
+      final String? value = _stringNamedArg(arguments, 'replaceInRouteName');
+      if (value != null) {
+        return value;
+      }
+    }
+  }
+  return null;
+}
+
+/// Applies auto_route's `'<pattern>,<replacement>'` rule to a page class name.
+String? _applyReplaceInRouteName(String className, String rule) {
+  final int separator = rule.lastIndexOf(',');
+  if (separator < 0) {
+    return null;
+  }
+  final String pattern = rule.substring(0, separator);
+  final String replacement = rule.substring(separator + 1);
+  if (pattern.isEmpty) {
+    return null;
+  }
+  final RegExp expression;
+  try {
+    expression = RegExp(pattern);
+  } on FormatException {
+    return null;
+  }
+  final String replaced = className.replaceAll(expression, replacement);
+  if (replaced.isEmpty || replaced == className) {
+    return null;
+  }
+  return '${replaced[0].toUpperCase()}${replaced.substring(1)}';
+}
+
 _RoutePageIndex _collectRoutePageFiles({
   required String projectRoot,
   required List<_DartUnit> units,
+  String? replaceInRouteName,
 }) {
   final Map<String, String> classFiles = <String, String>{};
   for (final _DartUnit unit in units) {
@@ -591,7 +645,22 @@ _RoutePageIndex _collectRoutePageFiles({
         continue;
       }
       final String className = declaration.name.lexeme;
-      final String routeId = _pageClassToRouteId(className);
+      final ArgumentList? routePageArguments = routePage.arguments;
+      // A route id can reach this class by three names: the suffix convention,
+      // the router's own replaceInRouteName rule, and an explicit
+      // `@RoutePage(name:)` override. Register all of them; they collapse to
+      // one entry when they agree.
+      final String? mangledId = replaceInRouteName == null
+          ? null
+          : _applyReplaceInRouteName(className, replaceInRouteName);
+      final String? explicitId = routePageArguments == null
+          ? null
+          : _stringNamedArg(routePageArguments, 'name');
+      final Set<String> routeIds = <String>{
+        _pageClassToRouteId(className),
+        if (mangledId != null) mangledId,
+        if (explicitId != null) explicitId,
+      };
       final String? childWidget = _extractReturnedWidgetType(declaration);
       final String? childFile =
           childWidget == null ? null : classFiles[childWidget];
@@ -611,11 +680,13 @@ _RoutePageIndex _collectRoutePageFiles({
         file: resolvedFile,
         widgetName: widgetName,
       );
-      _mergeRoutePageBinding(
-        bindings: bindings,
-        routeId: routeId,
-        binding: binding,
-      );
+      for (final String routeId in routeIds) {
+        _mergeRoutePageBinding(
+          bindings: bindings,
+          routeId: routeId,
+          binding: binding,
+        );
+      }
       _mergeRoutePageBinding(
         bindings: byClassName,
         routeId: className,
