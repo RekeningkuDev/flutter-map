@@ -63,6 +63,21 @@ class ConstStringTable {
     return _evaluate(expression, _values, null);
   }
 
+  /// Resolves [expression], preferring constants declared on [className].
+  ///
+  /// A bare identifier such as `routeName` is ambiguous when several classes in
+  /// the same unit declare it, so callers that know the owning class should use
+  /// this instead of [resolveExpression].
+  String? resolveExpressionInClass(Expression expression, String? className) {
+    if (className != null && expression is SimpleIdentifier) {
+      final String? scoped = _values['$className.${expression.name}'];
+      if (scoped != null) {
+        return scoped;
+      }
+    }
+    return resolveExpression(expression);
+  }
+
   /// Snapshot of resolved constant keys (`Routes.home`, `AppPaths.eventHub`, …).
   Map<String, String> get values => Map<String, String>.unmodifiable(_values);
 

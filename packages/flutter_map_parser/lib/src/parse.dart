@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_map_parser/src/detect.dart';
 import 'package:flutter_map_parser/src/edges.dart';
 import 'package:flutter_map_parser/src/hints.dart';
@@ -46,6 +48,10 @@ RouteGraph parseProject(String projectRoot) {
         throw StateError(
           'auto_route was detected but no AutoRoute entries were found.',
         );
+      }
+      // A silently dropped entry is indistinguishable from a smaller app.
+      for (final String entry in parsed.unresolvedEntries) {
+        stderr.writeln('warning: unresolved routes entry: $entry');
       }
     case RoutingMode.goRouter:
       final GoRouterParseResult parsed = parseGoRouterProject(resolvedRoot);
