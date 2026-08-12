@@ -31,6 +31,7 @@ void main() {
       equals(<String>{
         'ShellRoute',
         'HomeRoute',
+        'InboxRoute',
         'ProfileRoute',
         'AboutRoute',
         'SettingsRoute',
@@ -92,6 +93,18 @@ void main() {
     );
     expect(details.file, 'lib/screens/details_main.dart');
     expect(details.params, equals(<String>['id']));
+  });
+
+  test('attributes an inline child to its own page class, not the shell', () {
+    final RouteGraph graph = parseProject(fixtureRoot);
+    final RouteNode inbox = graph.routes.firstWhere(
+      (RouteNode route) => route.id == 'InboxRoute',
+    );
+    // `InboxMain` is named by neither the Page nor the Screen convention, so
+    // this only resolves if the router's `replaceInRouteName` is applied.
+    expect(inbox.file, 'lib/screens/inbox_main.dart');
+    expect(inbox.widgetName, 'InboxScreen');
+    expect(inbox.urlPath, '/inbox');
   });
 
   test('does not leak a layout onto later siblings', () {
