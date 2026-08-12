@@ -4,8 +4,25 @@ import 'package:analyzer/dart/analysis/features.dart';
 import 'package:analyzer/dart/analysis/results.dart';
 import 'package:analyzer/dart/analysis/utilities.dart';
 import 'package:analyzer/dart/ast/ast.dart';
+import 'package:flutter_map_parser/src/const_strings.dart';
 import 'package:flutter_map_parser/src/model.dart';
 import 'package:path/path.dart' as p;
+
+/// Constructor names that build an `AutoRoute` (or one of its subclasses).
+///
+/// auto_route ships several `AutoRoute` subclasses and real apps use them far
+/// more often than the base class, so the route table has to accept the whole
+/// family rather than a single name.
+const Set<String> _routeConstructorNames = <String>{
+  'AutoRoute',
+  'AdaptiveRoute',
+  'CustomRoute',
+  'MaterialRoute',
+  'CupertinoRoute',
+};
+
+/// Maximum number of `X.route` -> `Y.route` hops followed for one entry.
+const int _maxReferenceHops = 8;
 
 /// Result of parsing `@AutoRouterConfig` route tables.
 class AutoRouteParseResult {
@@ -23,9 +40,15 @@ class AutoRouteParseResult {
 /// Parses auto_route `@AutoRouterConfig` routers under [projectRoot]/lib.
 AutoRouteParseResult parseAutoRouteProject(String projectRoot) {
   final List<_DartUnit> units = _loadDartUnits(projectRoot);
+  final _ResolveContext context = _ResolveContext.build(
+    projectRoot: projectRoot,
+    units: units,
+  );
+  final String? replaceInRouteName = _findReplaceInRouteName(units);
   final Map<String, _RoutePageBinding> routePageFiles = _collectRoutePageFiles(
     projectRoot: projectRoot,
     units: units,
+    replaceInRouteName: replaceInRouteName,
   );
   final List<RouteNode> routes = <RouteNode>[];
   final List<LayoutNode> layouts = <LayoutNode>[];
@@ -56,6 +79,9 @@ AutoRouteParseResult parseAutoRouteProject(String projectRoot) {
         layouts: layouts,
         seenIds: seenIds,
         routerFile: routerFile,
+        context: context,
+        owner: context.classes[declaration.name.lexeme],
+        activeRefs: const <String>{},
       );
     }
   }
@@ -75,6 +101,9 @@ void _walkAutoRoutes({
   required List<LayoutNode> layouts,
   required Set<String> seenIds,
   required String routerFile,
+  required _ResolveContext context,
+  required _ClassEntry? owner,
+  required Set<String> activeRefs,
 }) {
   final ListLiteral? list = expression is ListLiteral ? expression : null;
   if (list == null) {
@@ -84,18 +113,35 @@ void _walkAutoRoutes({
     if (element is! Expression) {
       continue;
     }
-    final _RouteCall? call = _asRouteCall(element);
-    if (call == null) {
+    _RouteCall? call = _asRouteCall(element);
+    if (call != null && call.name == 'RedirectRoute') {
       continue;
     }
-    if (call.name == 'RedirectRoute') {
-      continue;
-    }
-    if (call.name != 'AutoRoute') {
-      continue;
+    _ClassEntry? elementOwner = owner;
+    Set<String> childRefs = activeRefs;
+    if (call == null || !_routeConstructorNames.contains(call.name)) {
+      // Reku-style indirection: the route table holds `X.route` or
+      // `X.route(...)` and the real constructor lives on class `X`.
+      final _ResolvedReference? resolved = context.resolveRouteReference(
+        expression: element,
+        blocked: activeRefs,
+      );
+      if (resolved == null) {
+        continue;
+      }
+      call = _asRouteCall(resolved.expression);
+      if (call == null || !_routeConstructorNames.contains(call.name)) {
+        continue;
+      }
+      elementOwner = resolved.owner;
+      childRefs = <String>{...activeRefs, ...resolved.chain};
     }
     final String? pageType = _pageTypeName(call.argumentList);
-    final String? rawPath = _stringNamedArg(call.argumentList, 'path');
+    final String? rawPath = _pathNamedArg(
+      argumentList: call.argumentList,
+      owner: elementOwner,
+      context: context,
+    );
     final bool initial = _boolNamedArg(call.argumentList, 'initial') ?? false;
     final String absolutePath = _resolveAbsolutePath(
       parentPath: parentPath,
@@ -117,8 +163,11 @@ void _walkAutoRoutes({
     }
     if (seenIds.add(id)) {
       final _RoutePageBinding? binding = routePageFiles[id];
+      final bool ownerIsPageLike = elementOwner != null &&
+          !_isRouterLikePath(elementOwner.file);
       final String file = binding?.file ??
-          _guessPageFile(projectRoot, id) ??
+          (ownerIsPageLike ? elementOwner.file : null) ??
+          _guessPageFile(context, id) ??
           routerFile;
       routes.add(
         RouteNode(
@@ -132,7 +181,8 @@ void _walkAutoRoutes({
               : (layouts.isEmpty ? 'stack' : layouts.last.navigator),
           layoutDir: layouts.isEmpty ? '' : layouts.last.dir,
           presentation: _presentation(call.argumentList),
-          widgetName: binding?.widgetName,
+          widgetName: binding?.widgetName ??
+              (ownerIsPageLike ? elementOwner.className : null),
         ),
       );
     }
@@ -146,6 +196,9 @@ void _walkAutoRoutes({
         layouts: layouts,
         seenIds: seenIds,
         routerFile: routerFile,
+        context: context,
+        owner: elementOwner,
+        activeRefs: childRefs,
       );
     }
   }
@@ -267,6 +320,181 @@ Expression? _getterExpression(MethodDeclaration getter) {
   return null;
 }
 
+/// A class declaration plus the file and constant scope it was declared in.
+class _ClassEntry {
+  const _ClassEntry({
+    required this.className,
+    required this.declaration,
+    required this.file,
+    required this.consts,
+  });
+
+  final String className;
+  final ClassDeclaration declaration;
+
+  /// Path relative to the project root, e.g. `lib/screens/home_main.dart`.
+  final String file;
+
+  /// Constants declared in the same compilation unit as [declaration].
+  final ConstStringTable consts;
+}
+
+/// One resolved `X.route` reference.
+class _ResolvedReference {
+  const _ResolvedReference({
+    required this.expression,
+    required this.owner,
+    required this.chain,
+  });
+
+  /// The route constructor expression the reference pointed at.
+  final Expression expression;
+
+  /// The class that declared [expression].
+  final _ClassEntry owner;
+
+  /// `Class.member` keys followed to get here, used as a cycle guard.
+  final Set<String> chain;
+}
+
+class _MemberRef {
+  const _MemberRef({required this.className, required this.memberName});
+
+  final String className;
+  final String memberName;
+
+  String get key => '$className.$memberName';
+}
+
+/// Index of every class in the project, used to follow route references.
+class _ResolveContext {
+  const _ResolveContext({
+    required this.classes,
+    required this.globalConsts,
+  });
+
+  final Map<String, _ClassEntry> classes;
+
+  /// `Class.member` -> value for every resolvable string constant.
+  final Map<String, String> globalConsts;
+
+  static _ResolveContext build({
+    required String projectRoot,
+    required List<_DartUnit> units,
+  }) {
+    final Map<String, _ClassEntry> classes = <String, _ClassEntry>{};
+    final Map<String, String> globalConsts = <String, String>{};
+    for (final _DartUnit unit in units) {
+      final ConstStringTable table = ConstStringTable.fromUnit(unit.unit);
+      final String file = _relative(projectRoot, unit.filePath);
+      table.values.forEach((String key, String value) {
+        if (key.contains('.')) {
+          globalConsts.putIfAbsent(key, () => value);
+        }
+      });
+      for (final ClassDeclaration declaration
+          in unit.unit.declarations.whereType<ClassDeclaration>()) {
+        classes.putIfAbsent(
+          declaration.name.lexeme,
+          () => _ClassEntry(
+            className: declaration.name.lexeme,
+            declaration: declaration,
+            file: file,
+            consts: table,
+          ),
+        );
+      }
+    }
+    return _ResolveContext(classes: classes, globalConsts: globalConsts);
+  }
+
+  /// Follows `X.route` / `X.route(...)` until it lands on a route constructor.
+  ///
+  /// Returns null when the reference cannot be resolved, or when following it
+  /// would revisit a member already on the current chain.
+  _ResolvedReference? resolveRouteReference({
+    required Expression expression,
+    required Set<String> blocked,
+  }) {
+    final Set<String> chain = <String>{};
+    Expression current = expression;
+    for (int hop = 0; hop < _maxReferenceHops; hop++) {
+      final _MemberRef? ref = _memberRefOf(current);
+      if (ref == null) {
+        return null;
+      }
+      if (blocked.contains(ref.key) || !chain.add(ref.key)) {
+        return null;
+      }
+      final _ClassEntry? entry = classes[ref.className];
+      if (entry == null) {
+        return null;
+      }
+      final Expression? value =
+          _memberExpression(entry.declaration, ref.memberName);
+      if (value == null) {
+        return null;
+      }
+      final _RouteCall? call = _asRouteCall(value);
+      if (call != null && _routeConstructorNames.contains(call.name)) {
+        return _ResolvedReference(
+          expression: value,
+          owner: entry,
+          chain: chain,
+        );
+      }
+      current = value;
+    }
+    return null;
+  }
+}
+
+_MemberRef? _memberRefOf(Expression expression) {
+  if (expression is PrefixedIdentifier) {
+    return _MemberRef(
+      className: expression.prefix.name,
+      memberName: expression.identifier.name,
+    );
+  }
+  if (expression is PropertyAccess) {
+    final Expression? target = expression.target;
+    if (target is SimpleIdentifier) {
+      return _MemberRef(
+        className: target.name,
+        memberName: expression.propertyName.name,
+      );
+    }
+  }
+  if (expression is MethodInvocation) {
+    final Expression? target = expression.target;
+    if (target is SimpleIdentifier) {
+      return _MemberRef(
+        className: target.name,
+        memberName: expression.methodName.name,
+      );
+    }
+  }
+  return null;
+}
+
+/// Returns the expression behind a `route` member in any of the three forms
+/// Reku uses: expression-bodied method, getter, or initialised field.
+Expression? _memberExpression(ClassDeclaration declaration, String memberName) {
+  for (final ClassMember member in declaration.members) {
+    if (member is MethodDeclaration && member.name.lexeme == memberName) {
+      return _getterExpression(member);
+    }
+    if (member is FieldDeclaration) {
+      for (final VariableDeclaration variable in member.fields.variables) {
+        if (variable.name.lexeme == memberName) {
+          return variable.initializer;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 class _RoutePageBinding {
   const _RoutePageBinding({
     required this.file,
@@ -277,9 +505,48 @@ class _RoutePageBinding {
   final String? widgetName;
 }
 
+/// Reads `replaceInRouteName` off the `@AutoRouterConfig` annotation.
+///
+/// auto_route derives generated route class names from it, so the parser has
+/// to apply the same rule to bind `XxxRoute` ids back to their source files.
+String? _findReplaceInRouteName(List<_DartUnit> units) {
+  for (final _DartUnit unit in units) {
+    for (final ClassDeclaration declaration
+        in unit.unit.declarations.whereType<ClassDeclaration>()) {
+      final Annotation? config = _findAnnotation(
+        declaration,
+        <String>{'AutoRouterConfig'},
+      );
+      final ArgumentList? arguments = config?.arguments;
+      if (arguments == null) {
+        continue;
+      }
+      final String? value =
+          _stringNamedArg(arguments, 'replaceInRouteName');
+      if (value != null) {
+        return value;
+      }
+    }
+  }
+  return null;
+}
+
+String _applyReplaceInRouteName(String className, String rule) {
+  final List<String> parts = rule.split(',');
+  if (parts.length != 2) {
+    return '${className}Route';
+  }
+  final String replaced = className.replaceAll(RegExp(parts[0]), parts[1]);
+  if (replaced.isEmpty) {
+    return '${className}Route';
+  }
+  return '${replaced[0].toUpperCase()}${replaced.substring(1)}';
+}
+
 Map<String, _RoutePageBinding> _collectRoutePageFiles({
   required String projectRoot,
   required List<_DartUnit> units,
+  String? replaceInRouteName,
 }) {
   final Map<String, String> classFiles = <String, String>{};
   for (final _DartUnit unit in units) {
@@ -302,7 +569,16 @@ Map<String, _RoutePageBinding> _collectRoutePageFiles({
         continue;
       }
       final String className = declaration.name.lexeme;
-      final String routeId = _pageClassToRouteId(className);
+      final ArgumentList? routePageArguments = routePage.arguments;
+      final String? explicitName = routePageArguments == null
+          ? null
+          : _stringNamedArg(routePageArguments, 'name');
+      final Set<String> routeIds = <String>{
+        _pageClassToRouteId(className),
+        if (explicitName != null) explicitName,
+        if (replaceInRouteName != null)
+          _applyReplaceInRouteName(className, replaceInRouteName),
+      };
       final String? childWidget = _extractReturnedWidgetType(declaration);
       final String? childFile =
           childWidget == null ? null : classFiles[childWidget];
@@ -318,14 +594,16 @@ Map<String, _RoutePageBinding> _collectRoutePageFiles({
           (className.endsWith('Page') || className.endsWith('Screen')
               ? className
               : null);
-      _mergeRoutePageBinding(
-        bindings: bindings,
-        routeId: routeId,
-        binding: _RoutePageBinding(
-          file: resolvedFile,
-          widgetName: widgetName,
-        ),
-      );
+      for (final String routeId in routeIds) {
+        _mergeRoutePageBinding(
+          bindings: bindings,
+          routeId: routeId,
+          binding: _RoutePageBinding(
+            file: resolvedFile,
+            widgetName: widgetName,
+          ),
+        );
+      }
     }
   }
   return bindings;
@@ -426,7 +704,7 @@ String _pageClassToRouteId(String className) {
   return '${className}Route';
 }
 
-String? _guessPageFile(String projectRoot, String routeId) {
+String? _guessPageFile(_ResolveContext context, String routeId) {
   String base = routeId;
   if (base.endsWith('Route')) {
     base = base.substring(0, base.length - 'Route'.length);
@@ -436,23 +714,10 @@ String? _guessPageFile(String projectRoot, String routeId) {
     '${base}Screen',
     base,
   ];
-  final Directory libDirectory = Directory(p.join(projectRoot, 'lib'));
-  if (!libDirectory.existsSync()) {
-    return null;
-  }
   for (final String candidate in candidates) {
-    final RegExp classPattern = RegExp('class\\s+$candidate\\b');
-    for (final FileSystemEntity entity
-        in libDirectory.listSync(recursive: true)) {
-      if (entity is! File || !entity.path.endsWith('.dart')) {
-        continue;
-      }
-      if (entity.path.endsWith('.gr.dart')) {
-        continue;
-      }
-      if (classPattern.hasMatch(entity.readAsStringSync())) {
-        return _relative(projectRoot, entity.path);
-      }
+    final _ClassEntry? entry = context.classes[candidate];
+    if (entry != null) {
+      return entry.file;
     }
   }
   return null;
@@ -548,6 +813,83 @@ String? _stringNamedArg(ArgumentList argumentList, String name) {
   }
   if (expression is AdjacentStrings) {
     return expression.stringValue;
+  }
+  return null;
+}
+
+/// Resolves `path:` which is a literal upstream but a `static const routeName`
+/// reference in every Reku screen.
+String? _pathNamedArg({
+  required ArgumentList argumentList,
+  required _ClassEntry? owner,
+  required _ResolveContext context,
+}) {
+  final Expression? expression = _namedArg(argumentList, 'path');
+  if (expression == null) {
+    return null;
+  }
+  if (expression is SimpleStringLiteral) {
+    return expression.value;
+  }
+  if (expression is AdjacentStrings) {
+    return expression.stringValue;
+  }
+  if (owner != null) {
+    if (expression is SimpleIdentifier) {
+      final String? scoped =
+          owner.consts.values['${owner.className}.${expression.name}'];
+      if (scoped != null) {
+        return scoped;
+      }
+    }
+    final String? resolved = owner.consts.resolveExpression(expression);
+    if (resolved != null) {
+      return resolved;
+    }
+    if (expression is SimpleIdentifier) {
+      final String? field = _stringFieldOf(owner, expression.name);
+      if (field != null) {
+        return field;
+      }
+    }
+  }
+  final _MemberRef? ref = _memberRefOf(expression);
+  if (ref != null) {
+    final String? global = context.globalConsts[ref.key];
+    if (global != null) {
+      return global;
+    }
+    final _ClassEntry? entry = context.classes[ref.className];
+    if (entry != null) {
+      return _stringFieldOf(entry, ref.memberName);
+    }
+  }
+  return null;
+}
+
+/// Reads a string-literal field off a class regardless of `const` / `final`.
+///
+/// [ConstStringTable] only tracks compile-time constants, but a handful of Reku
+/// screens declare `static String routeName = '...'`, which is still a usable
+/// static path.
+String? _stringFieldOf(_ClassEntry entry, String fieldName) {
+  for (final ClassMember member in entry.declaration.members) {
+    if (member is! FieldDeclaration) {
+      continue;
+    }
+    for (final VariableDeclaration variable in member.fields.variables) {
+      if (variable.name.lexeme != fieldName) {
+        continue;
+      }
+      final Expression? initializer = variable.initializer;
+      if (initializer is SimpleStringLiteral) {
+        return initializer.value;
+      }
+      if (initializer is AdjacentStrings) {
+        return initializer.stringValue;
+      }
+      return null;
+    }
   }
   return null;
 }
